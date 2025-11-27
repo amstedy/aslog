@@ -5,15 +5,22 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
+
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 512)
+		return &b
+	},
+}
 
 // Config defines the configuration for VLHandler.
 type Config struct {
@@ -27,14 +34,45 @@ type Config struct {
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig(url string) Config {
+	normalizedURL := normalizeVictoriaLogsURL(url)
+
 	return Config{
-		URL:           url,
+		URL:           normalizedURL,
 		BatchSize:     100,
 		FlushInterval: time.Second,
 		BufferBytes:   1000,
 		MaxRetries:    3,
 		Timeout:       5 * time.Second,
 	}
+}
+
+// normalizeVictoriaLogsURL builds a full VictoriaLogs URL from a user-provided host
+// or URL. The user may pass just a host (e.g. "logs.example.com"), a host with scheme
+// (e.g. "https://logs.example.com"), or a full URL. If the path is empty, "/insert/"
+// is appended. If no scheme is provided, "https" is used.
+func normalizeVictoriaLogsURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+
+	// If there is no scheme, default to https.
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		// In case of parsing error, fall back to the original value.
+		return raw
+	}
+
+	// If no explicit path is provided, default to VictoriaLogs insert path.
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/insert/jsonline"
+	}
+
+	return u.String()
 }
 
 // Validate checks if the config is valid.
@@ -68,7 +106,7 @@ type VLHandler struct {
 	wg              sync.WaitGroup
 	done            chan struct{}
 	overflowCh      chan struct{}
-	streamfields    map[string]string
+	streamfields    [][2]string
 	streamfieldsraw string
 
 	// Immutable after creation
@@ -89,7 +127,7 @@ func NewVLHandler(cfg Config) (*VLHandler, error) {
 		buffer:          newBuffer(cfg.BufferBytes),
 		done:            make(chan struct{}),
 		overflowCh:      make(chan struct{}, 1),
-		streamfields:    make(map[string]string, 0),
+		streamfields:    make([][2]string, 0, 5),
 		streamfieldsraw: "",
 	}
 
@@ -100,15 +138,12 @@ func NewVLHandler(cfg Config) (*VLHandler, error) {
 }
 
 func (h *VLHandler) AddStreamField(key string, value string) {
-	h.streamfields[key] = value
+	h.streamfields = append(h.streamfields, [2]string{key, value})
 
 	if h.streamfieldsraw != "" {
 		h.streamfieldsraw += ","
 	}
 	h.streamfieldsraw += key
-
-	fmt.Println(h.streamfieldsraw)
-	fmt.Println(h.streamfields)
 }
 
 // Enabled reports whether the handler handles records at the given level.
@@ -119,80 +154,102 @@ func (h *VLHandler) Enabled(_ context.Context, _ slog.Level) bool {
 // Handle handles the Record.
 func (h *VLHandler) Handle(_ context.Context, r slog.Record) error {
 
-	// log.Println(h.streamfieldsraw)
-	// log.Println(h.streamfields)
+	bufPtr := bufPool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
 
-	// Pre-allocate map with expected capacity
-	fields := make(map[string]any, 3+len(h.baseAttrs)+r.NumAttrs())
-
-	// Standard fields
-	fields["_time"] = r.Time.Format(time.RFC3339Nano)
-	fields["level"] = r.Level.String()
-	fields["_msg"] = r.Message
+	buf = append(buf, `{"_time":"`...)
+	buf = r.Time.AppendFormat(buf, time.RFC3339Nano)
+	buf = append(buf, `","level":"`...)
+	buf = append(buf, r.Level.String()...)
+	buf = append(buf, `","_msg":`...)
+	buf = strconv.AppendQuote(buf, r.Message)
+	buf = append(buf, `,`...)
 
 	// Static stream fields from config
-	for k, v := range h.streamfields {
-		fields[k] = v
+	for _, sf := range h.streamfields {
+		buf = strconv.AppendQuote(buf, sf[0])
+		buf = append(buf, `:`...)
+		buf = strconv.AppendQuote(buf, sf[1])
+		buf = append(buf, `,`...)
 	}
 
 	// Base attributes (from WithAttrs)
 	for _, attr := range h.baseAttrs {
-		h.addAttr(fields, attr)
+		buf = h.addAttr(buf, attr)
 	}
 
 	// Record attributes
 	r.Attrs(func(a slog.Attr) bool {
-		h.addAttr(fields, a)
+		buf = h.addAttr(buf, a)
 		return true
 	})
 
-	// Serialize
-	data, err := json.Marshal(fields)
-	if err != nil {
-		return fmt.Errorf("aslog: marshal error: %w", err)
-	}
+	// Remove the last comma and close the JSON
+	buf[len(buf)-1] = '}'
 
-	// If buffer overflows, send the batch and notify the worker
-	if h.buffer.Write(data) {
+	if h.buffer.Write(buf) {
 		select {
 		case h.overflowCh <- struct{}{}:
 		default:
 		}
 	}
 
+	*bufPtr = buf
+	bufPool.Put(bufPtr)
+
 	return nil
 }
 
-func (h *VLHandler) addAttr(fields map[string]any, attr slog.Attr) {
-	key := attr.Key
+func (h *VLHandler) addAttr(buf []byte, attr slog.Attr) []byte {
+
+	keyBuff := make([]byte, 0, 112)
 
 	// Support for groups: group1.group2.key
 	if len(h.groups) > 0 {
-		var buf bytes.Buffer
-		for i, g := range h.groups {
-			if i > 0 {
-				buf.WriteByte('.')
-			}
-			buf.WriteString(g)
-		}
-		buf.WriteByte('.')
-		buf.WriteString(attr.Key)
-		key = buf.String()
+		keyBuff = append(keyBuff, []byte(strings.Join(h.groups, "."))...)
+		keyBuff = append(keyBuff, '.')
+		keyBuff = append(keyBuff, []byte(attr.Key)...)
+	} else {
+		keyBuff = append(keyBuff, []byte(attr.Key)...)
 	}
 
 	// Handle nested groups in values
 	val := attr.Value.Resolve()
 	if val.Kind() == slog.KindGroup {
 		for _, groupAttr := range val.Group() {
-			h.addAttr(fields, slog.Attr{
-				Key:   key + "." + groupAttr.Key,
+			buf = h.addAttr(buf, slog.Attr{
+				Key:   string(keyBuff) + "." + groupAttr.Key,
 				Value: groupAttr.Value,
 			})
 		}
-		return
+		return buf
 	}
 
-	fields[key] = val.Any()
+	buf = strconv.AppendQuote(buf, string(keyBuff))
+	buf = append(buf, `:`...)
+
+	switch val.Kind() {
+	case slog.KindString:
+		buf = strconv.AppendQuote(buf, val.String())
+	case slog.KindInt64:
+		buf = strconv.AppendInt(buf, val.Int64(), 10)
+	case slog.KindUint64:
+		buf = strconv.AppendUint(buf, val.Uint64(), 10)
+	case slog.KindFloat64:
+		buf = strconv.AppendFloat(buf, val.Float64(), 'f', -1, 64)
+	case slog.KindBool:
+		buf = strconv.AppendBool(buf, val.Bool())
+	case slog.KindDuration:
+		buf = append(buf, []byte(val.Duration().String())...)
+	case slog.KindTime:
+		buf = val.Time().AppendFormat(buf, time.RFC3339Nano)
+	default:
+		buf = strconv.AppendQuote(buf, val.String())
+	}
+
+	buf = append(buf, `,`...)
+
+	return buf
 }
 
 // WithAttrs returns a new Handler with additional attributes.
@@ -260,6 +317,7 @@ func (h *VLHandler) worker() {
 			go h.flushAndSend()
 
 		case <-h.done:
+			h.flushAndSend()
 			return
 		}
 	}
@@ -292,8 +350,6 @@ func (h *VLHandler) sendBatch(batch [][]byte) {
 		req.Header.Set("Content-Length", strconv.Itoa(len(compressedBody)))
 
 		req.Header.Set("VL-Stream-Fields", h.streamfieldsraw)
-
-		fmt.Println("VL-Stream-Fields", h.streamfieldsraw)
 
 		resp, err := h.client.Do(req)
 		if err != nil {
