@@ -37,7 +37,6 @@ func DefaultConfig(url string) Config {
 
 	return Config{
 		URL:           normalizedURL,
-		BatchSize:     100,
 		FlushInterval: time.Second,
 		BufferBytes:   1000,
 		MaxRetries:    3,
