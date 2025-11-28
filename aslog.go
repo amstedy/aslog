@@ -25,7 +25,6 @@ var bufPool = sync.Pool{
 // Config defines the configuration for VLHandler.
 type Config struct {
 	URL           string        // VictoriaLogs URL
-	BatchSize     int           // Maximum number of logs in a batch
 	FlushInterval time.Duration // Maximum time between flushes
 	BufferBytes   int           // Maximum size of the internal buffer, in bytes
 	MaxRetries    int           // Maximum number of retry attempts
@@ -79,9 +78,6 @@ func normalizeVictoriaLogsURL(raw string) string {
 func (c Config) Validate() error {
 	if c.URL == "" {
 		return errors.New("aslog: URL cannot be empty")
-	}
-	if c.BatchSize <= 0 {
-		return errors.New("aslog: BatchSize must be positive")
 	}
 	if c.FlushInterval <= 0 {
 		return errors.New("aslog: FlushInterval must be positive")
