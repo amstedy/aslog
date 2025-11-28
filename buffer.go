@@ -24,7 +24,10 @@ func (b *buffer) Write(p []byte) (overflow bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.data = append(b.data, p)
+	pCopy := make([]byte, len(p))
+	copy(pCopy, p)
+
+	b.data = append(b.data, pCopy)
 	b.bytes += len(p)
 
 	if b.bytes > b.maxBytes {
