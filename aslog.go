@@ -33,10 +33,8 @@ type Config struct {
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig(url string) Config {
-	normalizedURL := normalizeVictoriaLogsURL(url)
-
 	return Config{
-		URL:           normalizedURL,
+		URL:           url,
 		FlushInterval: time.Second,
 		BufferBytes:   1000,
 		MaxRetries:    3,
@@ -75,6 +73,9 @@ func normalizeVictoriaLogsURL(raw string) string {
 
 // Validate checks if the config is valid.
 func (c Config) Validate() error {
+
+	c.URL = normalizeVictoriaLogsURL(c.URL)
+
 	if c.URL == "" {
 		return errors.New("aslog: URL cannot be empty")
 	}
