@@ -72,7 +72,7 @@ func normalizeVictoriaLogsURL(raw string) string {
 }
 
 // Validate checks if the config is valid.
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
 
 	c.URL = normalizeVictoriaLogsURL(c.URL)
 
