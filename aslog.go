@@ -96,7 +96,7 @@ func (c Config) Validate() error {
 
 // VLHandler is a slog.Handler that sends logs to VictoriaLogs.
 type VLHandler struct {
-	cfg             Config
+	cfg             *Config
 	client          *http.Client
 	buffer          *buffer
 	wg              sync.WaitGroup
@@ -112,7 +112,7 @@ type VLHandler struct {
 
 // NewVLHandler creates a new VLHandler with the given config.
 // The handler must be closed with Close() to ensure all logs are flushed.
-func NewVLHandler(cfg Config) (*VLHandler, error) {
+func NewVLHandler(cfg *Config) (*VLHandler, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
