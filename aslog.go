@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -32,8 +33,8 @@ type Config struct {
 }
 
 // DefaultConfig returns a Config with sensible defaults.
-func DefaultConfig(url string) Config {
-	return Config{
+func DefaultConfig(url string) *Config {
+	return &Config{
 		URL:           url,
 		FlushInterval: time.Second,
 		BufferBytes:   1000,
@@ -236,9 +237,9 @@ func (h *VLHandler) addAttr(buf []byte, attr slog.Attr) []byte {
 	case slog.KindBool:
 		buf = strconv.AppendBool(buf, val.Bool())
 	case slog.KindDuration:
-		buf = append(buf, []byte(val.Duration().String())...)
+		buf = strconv.AppendQuote(buf, val.Duration().String())
 	case slog.KindTime:
-		buf = val.Time().AppendFormat(buf, time.RFC3339Nano)
+		buf = strconv.AppendQuote(buf, val.Time().Format(time.RFC3339Nano))
 	default:
 		buf = strconv.AppendQuote(buf, val.String())
 	}
@@ -367,6 +368,9 @@ func (h *VLHandler) sendBatch(batch [][]byte) {
 
 		// Retry on 5xx errors, but not on 4xx
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+
+			log.Println("victoria logs 4xx error", resp.StatusCode)
+
 			return
 		}
 
